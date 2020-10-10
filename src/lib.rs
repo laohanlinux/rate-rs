@@ -1,10 +1,12 @@
 // Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
+#![feature(duration_consts_2)]
 
-use std::time::{Duration, SystemTime};
 use std::ops::Sub;
+use std::time::{Duration, SystemTime};
 use std::u64::MAX;
+use std::fs::read;
 
 /// A limiter controls how frequently events are allowed to happen.
 /// It implements a `token bucket` of size **b**, initially full and refilled
@@ -86,7 +88,7 @@ impl Limiter {
     // A helper method for `allow_n`, `reserve_n` and `wait_n`.
     // `max_future_reserve` specifies the maximum reservation wait duration allowed.
     // `reserve_n` returns `reservation`, not *reservation* to avoid allocation in `allow_n` and `wait_n`
-    fn reserve_n(&mut self, now: SystemTime, n: isize, max_future_reserve Duration)
+    fn reserve_n(&mut self, now: SystemTime, n: isize, max_future_reserve: Duration)
     {}
 
     /// `advance` calculates and returns an updated state for lim resulting from the passage of time.
@@ -101,7 +103,7 @@ impl Limiter {
         // Avoid making delta overflow below when last is very old.
         // |T1|T2|T3|T4|T5
         //  t < T5
-        let max_elapsed = self.limit.duration_from_tokens(self.burst - self.tokens);
+        let max_elapsed = self.limit.duration_from_tokens(self.burst as f64 - self.tokens);
         let mut elapsed = now.duration_since(last).unwrap();
         if elapsed > max_elapsed {
             elapsed = max_elapsed;
@@ -142,6 +144,8 @@ impl Reservation {
     /// Cancel does nothing.
     pub fn ok(&self) -> bool { self.ok }
 
+    /// Shorthand for `delay_from(SystemTime::now())`
+    pub fn delay(&self) -> Duration { self.delay_from(SystemTime::now()) }
 
     /// Returns the duration for which the `reservation` holder must wait
     /// before taking the reserved action. Zero duration means act immediately.
@@ -151,10 +155,27 @@ impl Reservation {
         if !self.ok {
             return INF_DURATION;
         }
-        self.time_to_act.duration_since(now).or_else(Duration::from_secs(0)).unwrap()
+        self.time_to_act.duration_since(now).unwrap_or(Duration::from_secs(0))
     }
 
-    
+    /// Indicates that the `reservation` holder will not perform the `reserved` action
+    /// and reverses the effects of this `Reservation` on the rate limit as much as possible,
+    /// considering that other `reservations` may have already been made.
+    pub fn cancel_at(&mut self, now: SystemTime) {
+        if !self.ok {
+            return;
+        }
+
+        let lim = self.lim.as_mut().unwrap();
+        if lim.limit == Inf || self.tokens == 0 || self.time_to_act <= now {
+            return;
+        }
+
+        // calculate tokens to restore
+        // The duration between lim.last_event and self.time_to_act tells use how many tokens were reserved
+        // after r was obtained. These tokens should not be restored.
+        let restore_tokens = self.tokens as f64 - self.limit.tokens
+    }
 }
 
 /// Limit defines the maximum frequency of some events.
@@ -182,7 +203,7 @@ impl Limit {
     /// A unit conversion function from a time duration to the number of tokens
     /// which could be accumulated during that duration at a rate of limit tokens per second.
     pub fn token_from_duration(&self, d: Duration) -> f64 {
-        d.as_nanos() / self.0
+        d.as_nanos() as f64 / self.0
     }
 }
 
@@ -207,8 +228,9 @@ pub fn every(interval: Duration) -> Limit {
 
 #[cfg(test)]
 mod tests {
-    use crate::{every, Inf, Limit};
     use std::time::Duration;
+
+    use crate::{every, Inf, Limit};
 
     #[test]
     fn t_limit() {
