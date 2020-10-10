@@ -1,0 +1,1 @@
+![https://en.wikipedia.org/wiki/Token_bucket](https://programmer.help/images/blog/e10f1cadb6196c3836907a61330c8e9e.jpg)

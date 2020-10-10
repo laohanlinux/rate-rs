@@ -3,25 +3,32 @@
 // license that can be found in the LICENSE file.
 
 use std::time::{Duration, SystemTime};
+use std::ops::Sub;
+use std::u64::MAX;
 
-/// Limit defines the maximum frequency of some events.
-/// Limit is represented as number of events per second.
-/// A zero Limit allows no events.
-
-type Limit = f64;
-
-/// Inf is the definite raft limit; it allows all events (event if burst is zero).
-const Inf: f64 = f64::MAX;
-
-pub fn every(interval: Duration) -> Limit {
-    if interval.as_secs() == 0 {
-        return Inf as Limit;
-    }
-
-    (1 / interval.as_secs()) as Limit
-}
-
-
+/// A limiter controls how frequently events are allowed to happen.
+/// It implements a `token bucket` of size **b**, initially full and refilled
+/// at rate `r` token *per second*.
+/// Informally, in any large enough time interval, the `Limiter` limits the
+/// rate to `r` tokens per second, with a maximum burst size of `b` events.
+/// As a special case, if `r==inf` (the infinite rate), `b` is ignored.
+/// See https://en.wikipedia.org/wiki/Token_bucket for more about token buckets.
+///
+/// The zero value is a valid Limiter, but it will reject all events.
+/// Use `Self::new()` to create *no-zero* Limiters.
+///
+/// Limiter has three main methods, `allow, reserve, and wait`.
+/// Most of callers should `wait`.
+///
+/// Each of the three methods consumes a single token.
+/// They differ in their behavior when no token is available.
+/// - If no token is available, `allow` returns false.
+/// - If no token is available, `reserve` returns a reservation for a future token
+/// and the amount of time the caller must wait before using it.
+/// - If no token if available, `wait` blocks until one can be obtained
+///
+/// The methods `allow_n, reserve_n, and wait_n` consume n tokens.
+#[derive(Debug, Clone)]
 pub struct Limiter {
     limit: Limit,
     burst: usize,
@@ -31,6 +38,11 @@ pub struct Limiter {
     // last_event is the latest time of a raft-limited event (past or future)
     last_event: SystemTime,
 }
+
+
+/// ThreadSafe Limiter
+#[derive(Debug)]
+pub struct LimiterSync {}
 
 impl Limiter {
     /// Returns a new `Limiter` that allows events up to rate r and permits
@@ -50,15 +62,15 @@ impl Limiter {
         self.limit
     }
 
-    /// Returns the maximum burst size. Burst is the maximum number of tokens
-    /// that can be consumed in a single call to Allow, Reserve, or Wait, so higher
-    /// Burst values allow more events to happen at once.
-    /// A zero Burst allows no events. unless limit == Inf.
+    /// Returns the maximum burst size. `Burst` is the maximum number of tokens
+    /// that can be consumed in a single call to `allow`, `reserve`, or `wait`, so higher
+    /// `burst` values allow more events to happen at once.
+    /// A `zero burst` allows no events. unless limit == Inf.
     pub fn burst(&self) -> usize {
         self.burst
     }
 
-    /// Shorthand for allow_n(SystemTime::now(), 1).
+    /// Shorthand for `allow_n(SystemTime::now(), 1)`.
     pub fn allow(&self) -> bool {
         self.allow_n(SystemTime::now(), 1)
     }
@@ -71,27 +83,146 @@ impl Limiter {
     }
 
 
-    // /// Advance calculates and returns an updated state for lim resulting from the passage of time.
-    // /// lim is not changed.
-    // /// advance requires that lim.mu is held.
-    // fn advance(&self, now: SystemTime) -> (SystemTime, SystemTime, f64) {
-    //     let mut last = self.last;
-    //     if now < last {
-    //         last = now;
-    //     }
-    //
+    // A helper method for `allow_n`, `reserve_n` and `wait_n`.
+    // `max_future_reserve` specifies the maximum reservation wait duration allowed.
+    // `reserve_n` returns `reservation`, not *reservation* to avoid allocation in `allow_n` and `wait_n`
+    fn reserve_n(&mut self, now: SystemTime, n: isize, max_future_reserve Duration)
+    {}
+
+    /// `advance` calculates and returns an updated state for lim resulting from the passage of time.
+    /// lim is not changed.
+    /// --advance requires that lim.mu is held--.
+    fn advance(&self, now: SystemTime) -> (SystemTime, SystemTime, f64) {
+        let mut last = self.last;
+        if now < last {
+            last = now;
+        }
+
+        // Avoid making delta overflow below when last is very old.
+        // |T1|T2|T3|T4|T5
+        //  t < T5
+        let max_elapsed = self.limit.duration_from_tokens(self.burst - self.tokens);
+        let mut elapsed = now.duration_since(last).unwrap();
+        if elapsed > max_elapsed {
+            elapsed = max_elapsed;
+        }
+
+        // Calculate the new number of tokens, due to time that passed.
+        let delta = self.limit.token_from_duration(elapsed);
+        let mut tokens = self.tokens + delta;
+        let burst = self.burst as f64;
+        if tokens > burst {
+            tokens = burst;
+        }
+        (now, last, tokens)
+    }
+
+    // fn duration_from_tokens(self, limit: Limit, tokens: f64) -> Duration {
+    //     let seconds = tokens /
     // }
 }
 
+
+/// A `Reservation` holds information about events that are permitted by a `Limiter` to happen after a delay.
+/// A `Reservation` may be canceled, which may enable the `Limiter` to permit additional events.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    ok: bool,
+    lim: Option<Limiter>,
+    tokens: usize,
+    time_to_act: SystemTime,
+    limit: Limiter, // This is the `Limit` at reservation time, it can change later.
+}
+
+const INF_DURATION: Duration = Duration::new(MAX, 0);
+
+impl Reservation {
+    /// Returns whether the limiter can provide the requested number of tokens.
+    /// within the maximum wait time. If `ok` is false, `Delay` returns `InfDuration`, and
+    /// Cancel does nothing.
+    pub fn ok(&self) -> bool { self.ok }
+
+
+    /// Returns the duration for which the `reservation` holder must wait
+    /// before taking the reserved action. Zero duration means act immediately.
+    /// `INF_DURATION` means the limiter cannot grant the tokens requested in this
+    /// `Reservation` within the maximum wait time.
+    pub fn delay_from(&self, now: SystemTime) -> Duration {
+        if !self.ok {
+            return INF_DURATION;
+        }
+        self.time_to_act.duration_since(now).or_else(Duration::from_secs(0)).unwrap()
+    }
+
+    
+}
+
+/// Limit defines the maximum frequency of some events.
+/// Limit is represented as number of events **per second**.
+/// A zero Limit allows no events.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct Limit(f64);
+
+impl Limit {
+    pub fn new(interval: Duration) -> Self {
+        if interval.as_nanos() < 0 {
+            return Limit(Inf);
+        } else {
+            Limit((1 / interval.as_nanos()) as f64)
+        }
+    }
+
+    /// A unit conversion function from the number of tokens to the duration
+    /// of time it takes to accumulate them at a rate of limit tokens per second.
+    pub fn duration_from_tokens(&self, tokens: f64) -> Duration {
+        let seconds = tokens / self.0;
+        Duration::from_secs_f64(seconds)
+    }
+
+    /// A unit conversion function from a time duration to the number of tokens
+    /// which could be accumulated during that duration at a rate of limit tokens per second.
+    pub fn token_from_duration(&self, d: Duration) -> f64 {
+        d.as_nanos() / self.0
+    }
+}
+
+impl From<f64> for Limit {
+    fn from(f: f64) -> Self {
+        Limit(f)
+    }
+}
+
+
+/// Inf is the definite raft limit; it allows all events (event if burst is zero).
+const Inf: f64 = f64::MAX;
+
+pub fn every(interval: Duration) -> Limit {
+    if interval.as_nanos() == 0 {
+        return Inf.into();
+    }
+
+    ((1 / interval.as_secs()) as f64).into()
+}
+
+
 #[cfg(test)]
 mod tests {
-    use crate::{every, Inf};
+    use crate::{every, Inf, Limit};
     use std::time::Duration;
 
     #[test]
-    fn t_every() {
-        assert_eq!(every(Duration::new(0, 0)), Inf);
-        let d = Duration::new(100, 993);
-        println!("{:?}", d.as_nanos());
+    fn t_limit() {
+        assert_ne!(Limit::from(10.0).0, Inf, "Limit(10) == Inf should be false");
     }
+
+    #[test]
+    fn t_every() {
+        let tests = vec![(Duration::from_secs(0), Inf)];
+        for (interval, exp) in tests {
+            let limit = every(interval);
+            assert_eq!(limit.0, exp);
+        }
+    }
+
+    fn t_close_enough() {}
 }
