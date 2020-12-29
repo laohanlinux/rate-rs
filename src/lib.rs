@@ -61,7 +61,7 @@ impl Limiter {
         }
     }
 
-    /// Returns the maximum overall event raft.
+    /// Returns the maximum overall event rate.
     pub fn limit(&self) -> Limit {
         self.limit
     }
@@ -75,23 +75,70 @@ impl Limiter {
     }
 
     /// Shorthand for `allow_n(SystemTime::now(), 1)`.
-    pub fn allow(&self) -> bool {
+    pub fn allow(&mut self) -> bool {
         self.allow_n(SystemTime::now(), 1)
     }
 
     /// Reports whether n events may happen at time now.
     /// Use this method if you intend to drop/skip events that exceed the rate limit.
     /// Otherwise use `reserve` or `wait`.
-    pub fn allow_n(&self, now: SystemTime, n: usize) -> bool {
-        true
+    pub fn allow_n(&mut self, now: SystemTime, n: usize) -> bool {
+        self.reserve_n(now, n, Duration::from_secs(0)).ok
     }
-
 
     // A helper method for `allow_n`, `reserve_n` and `wait_n`.
     // `max_future_reserve` specifies the maximum reservation wait duration allowed.
     // `reserve_n` returns `reservation`, not *reservation* to avoid allocation in `allow_n` and `wait_n`
-    fn reserve_n(&mut self, now: SystemTime, n: isize, max_future_reserve: Duration)
-    {}
+    fn reserve_n(&mut self, now: SystemTime, n: usize, max_future_reserve: Duration) -> Reservation{
+        // TODO: add lock
+        if self.limit.0 == INF{
+            return Reservation{
+               ok: true,
+               lim: Some(self.clone()),
+               limit: Limit(0.0),
+               tokens: n,
+               time_to_act: now,
+            };
+        }
+    
+
+        let (now, last, mut tokens) = self.advance(now);
+        // Calculate the remaining number of tokens resulting from the request.
+        tokens -= n as f64; 
+        
+        // Calculate the wait duration 
+        let mut wait_duration = Duration::from_secs(0);
+        if tokens <  0.0 {
+            wait_duration = self.limit.duration_from_tokens(-tokens);
+        }
+        
+        // Decide result
+        let ok = n <= self.burst && wait_duration <= max_future_reserve;
+
+        // Prepare reservation
+        let mut r = Reservation{
+            ok: true,
+            lim: Some(self.clone()),
+            limit: self.limit,
+            tokens: 0,
+            time_to_act: SystemTime::now(), // TODO: set zero time 
+        };
+        if ok {
+            r.tokens = n;
+            r.time_to_act = now.add(wait_duration);
+        }
+
+        // Update state
+        if ok {
+            self.last = now;
+            self.tokens = tokens;
+            self.last_event = r.time_to_act;
+        }else {
+            self.last = last;
+        }
+
+        r
+    }
 
     /// `advance` calculates and returns an updated state for lim resulting from the passage of time.
     /// lim is not changed.
@@ -134,7 +181,7 @@ pub struct Reservation {
     lim: Option<Limiter>,
     tokens: usize,
     time_to_act: SystemTime,
-    limit: Limiter, // This is the `Limit` at reservation time, it can change later.
+    limit: Limit, // This is the `Limit` at reservation time, it can change later.
 }
 
 const INF_DURATION: Duration = Duration::new(MAX, 0);
@@ -177,7 +224,7 @@ impl Reservation {
         // The duration between lim.last_event and self.time_to_act tells use how many tokens were reserved
         // after r was obtained. These tokens should not be restored.
         let mut lim = self.lim.as_mut().unwrap();
-        let restore_tokens = self.tokens as f64 - self.limit.limit.token_from_duration(lim.last_event.duration_since(self.time_to_act));
+        let restore_tokens = self.tokens as f64 - self.limit.token_from_duration(lim.last_event.duration_since(self.time_to_act).unwrap());
         if restore_tokens <= 0.0 {
             return;
         }
@@ -192,9 +239,9 @@ impl Reservation {
         lim.last = now;
         lim.tokens = tokens;
         if self.time_to_act == lim.last_event {
-            let pre_event = self.time_to_act.add(self.limit.limit.duration_from_tokens(-1.0 * tokens as f64));
+            let pre_event = self.time_to_act.add(self.limit.duration_from_tokens(-1.0 * tokens as f64));
             if pre_event <= now {
-                self.lim.last_event = pre_event;
+                lim.last_event = pre_event;
             }
         }
     }
