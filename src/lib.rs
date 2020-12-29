@@ -3,17 +3,19 @@
 // license that can be found in the LICENSE file.
 #![feature(duration_consts_2)]
 
-use std::ops::Sub;
+use std::ops::{Sub, Add};
 use std::time::{Duration, SystemTime};
 use std::u64::MAX;
 use std::fs::read;
+use tokio::sync::Mutex;
+use std::borrow::Borrow;
 
 /// A limiter controls how frequently events are allowed to happen.
 /// It implements a `token bucket` of size **b**, initially full and refilled
 /// at rate `r` token *per second*.
 /// Informally, in any large enough time interval, the `Limiter` limits the
 /// rate to `r` tokens per second, with a maximum burst size of `b` events.
-/// As a special case, if `r==inf` (the infinite rate), `b` is ignored.
+/// As a special case, if `r==INF` (the infinite rate), `b` is ignored.
 /// See https://en.wikipedia.org/wiki/Token_bucket for more about token buckets.
 ///
 /// The zero value is a valid Limiter, but it will reject all events.
@@ -35,9 +37,9 @@ pub struct Limiter {
     limit: Limit,
     burst: usize,
     tokens: f64,
-    // last is the last time the limiter's tokens field was updated.
+    // The last time the limiter's tokens field was updated.
     last: SystemTime,
-    // last_event is the latest time of a raft-limited event (past or future)
+    // The latest time of a raft-limited event (past or future).
     last_event: SystemTime,
 }
 
@@ -124,7 +126,6 @@ impl Limiter {
     // }
 }
 
-
 /// A `Reservation` holds information about events that are permitted by a `Limiter` to happen after a delay.
 /// A `Reservation` may be canceled, which may enable the `Limiter` to permit additional events.
 #[derive(Debug, Clone)]
@@ -166,15 +167,49 @@ impl Reservation {
             return;
         }
 
+        // TODO: add lock
         let lim = self.lim.as_mut().unwrap();
-        if lim.limit == Inf || self.tokens == 0 || self.time_to_act <= now {
+        if lim.limit.0 == INF || self.tokens == 0 || self.time_to_act <= now {
             return;
         }
 
         // calculate tokens to restore
         // The duration between lim.last_event and self.time_to_act tells use how many tokens were reserved
         // after r was obtained. These tokens should not be restored.
-        let restore_tokens = self.tokens as f64 - self.limit.tokens
+        let mut lim = self.lim.as_mut().unwrap();
+        let restore_tokens = self.tokens as f64 - self.limit.limit.token_from_duration(lim.last_event.duration_since(self.time_to_act));
+        if restore_tokens <= 0.0 {
+            return;
+        }
+        // advance time to now
+        let (now, _, mut tokens) = lim.advance(now);
+        // calculate new number of tokens
+        tokens += restore_tokens;
+        if tokens > lim.burst as f64 {
+            tokens = lim.burst as f64;
+        }
+        // update state
+        lim.last = now;
+        lim.tokens = tokens;
+        if self.time_to_act == lim.last_event {
+            let pre_event = self.time_to_act.add(self.limit.limit.duration_from_tokens(-1.0 * tokens as f64));
+            if pre_event <= now {
+                self.lim.last_event = pre_event;
+            }
+        }
+    }
+
+    /// Blocks until lim permits n events to happen.
+    /// It returns an error if n exceeds the Limiter's burst size, the Context is
+    /// canceled, or the expected wait time exceeds the Context's Deadline.
+    /// The burst limit is ignored if the rate limit is INF.
+    pub fn wait_n(&mut self, timer: SystemTime, n: isize) -> Result<(), &str> {
+        let now = SystemTime::now();
+        if now < timer {
+            return Err("timer out");
+        }
+
+        Ok(())
     }
 }
 
@@ -187,7 +222,7 @@ pub struct Limit(f64);
 impl Limit {
     pub fn new(interval: Duration) -> Self {
         if interval.as_nanos() < 0 {
-            return Limit(Inf);
+            return Limit(INF);
         } else {
             Limit((1 / interval.as_nanos()) as f64)
         }
@@ -215,11 +250,11 @@ impl From<f64> for Limit {
 
 
 /// Inf is the definite raft limit; it allows all events (event if burst is zero).
-const Inf: f64 = f64::MAX;
+const INF: f64 = f64::MAX;
 
 pub fn every(interval: Duration) -> Limit {
     if interval.as_nanos() == 0 {
-        return Inf.into();
+        return INF.into();
     }
 
     ((1 / interval.as_secs()) as f64).into()
@@ -228,23 +263,26 @@ pub fn every(interval: Duration) -> Limit {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use crate::{every, Inf, Limit};
+    use crate::{every, INF, Limit};
 
     #[test]
     fn t_limit() {
-        assert_ne!(Limit::from(10.0).0, Inf, "Limit(10) == Inf should be false");
+        assert_ne!(Limit::from(10.0).0, INF, "Limit(10) == Inf should be false");
     }
 
     #[test]
     fn t_every() {
-        let tests = vec![(Duration::from_secs(0), Inf)];
+        let tests = vec![(Duration::from_secs(0), INF)];
         for (interval, exp) in tests {
             let limit = every(interval);
             assert_eq!(limit.0, exp);
         }
     }
+
+    #[test]
+    fn timer() {}
 
     fn t_close_enough() {}
 }
