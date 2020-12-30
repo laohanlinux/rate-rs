@@ -86,32 +86,52 @@ impl Limiter {
         self.reserve_n(now, n, Duration::from_secs(0)).ok
     }
 
-    // A helper method for `allow_n`, `reserve_n` and `wait_n`.
-    // `max_future_reserve` specifies the maximum reservation wait duration allowed.
-    // `reserve_n` returns `reservation`, not *reservation* to avoid allocation in `allow_n` and `wait_n`
-    fn reserve_n(&mut self, now: SystemTime, n: usize, max_future_reserve: Duration) -> Reservation{
+    /// Returns a `Reservation` that indicates how long the caller must wait before n events
+    /// happen. 
+    /// The Limiter takes this `Reservation` into account when allowing future events.
+    /// The returned `Reservation` ok() method returns false if n exceeds the Limiter's burst size.
+    /// User Example:
+    ///  let r = lim.reserve_n(SystemTime::now(), 1)
+    ///  if !r.ok() {
+    ///     // Not allowed to act! Did you member to set lim.burst to be > 0 ?
+    ///     return;
+    ///  }
+    ///  time.Sleep(r.delay())
+    ///  act()
+    /// Use this method if you wish to wait and slow down in accordance with the rate limit without
+    /// dropping events. 
+    /// If you need to respect a dealine or cancel the delay, use `wait` instead.
+    /// To drop or skip events exceeding rate limit, use `allow` instead.
+    pub fn reserve_n(&mut self, now: SystemTime, n: usize) -> Reservation {
+        self.reserve_n2(now, n, INF_DURATION)
+    }
+   
+    // A helper method for allow_n, reserve_n, and wait_n.
+    // max_future_reserve specifies the maximum reservation wait duration allowed.
+    // reserve_n returns `Reservation`, not &Reservation, to avoid allocation in allow_n and wait_n
+    fn reserve_n2(&mut self, now: SystemTime, n: usize, max_future_reserve: Duration) -> Reservation{
         // TODO: add lock
-        if self.limit.0 == INF{
+        if self.limit.0 == INF {
             return Reservation{
-               ok: true,
-               lim: Some(self.clone()),
-               limit: Limit(0.0),
-               tokens: n,
-               time_to_act: now,
+                ok: true,
+                lim: Some(self.clone()),
+                limit: Limit(0.0),
+                tokens: n,
+                time_to_act: now,
             };
         }
-    
+
 
         let (now, last, mut tokens) = self.advance(now);
         // Calculate the remaining number of tokens resulting from the request.
         tokens -= n as f64; 
-        
+
         // Calculate the wait duration 
         let mut wait_duration = Duration::from_secs(0);
         if tokens <  0.0 {
             wait_duration = self.limit.duration_from_tokens(-tokens);
         }
-        
+
         // Decide result
         let ok = n <= self.burst && wait_duration <= max_future_reserve;
 
@@ -167,10 +187,6 @@ impl Limiter {
         }
         (now, last, tokens)
     }
-
-    // fn duration_from_tokens(self, limit: Limit, tokens: f64) -> Duration {
-    //     let seconds = tokens /
-    // }
 }
 
 /// A `Reservation` holds information about events that are permitted by a `Limiter` to happen after a delay.
@@ -268,7 +284,7 @@ pub struct Limit(f64);
 
 impl Limit {
     pub fn new(interval: Duration) -> Self {
-        if interval.as_nanos() < 0 {
+        if interval.as_nanos() <= 0u128 {
             return Limit(INF);
         } else {
             Limit((1 / interval.as_nanos()) as f64)
@@ -295,8 +311,7 @@ impl From<f64> for Limit {
     }
 }
 
-
-/// Inf is the definite raft limit; it allows all events (event if burst is zero).
+/// The definite rate limit; it allows all events (event if burst is zero).
 const INF: f64 = f64::MAX;
 
 pub fn every(interval: Duration) -> Limit {
@@ -316,7 +331,7 @@ mod tests {
 
     #[test]
     fn t_limit() {
-        assert_ne!(Limit::from(10.0).0, INF, "Limit(10) == Inf should be false");
+        assert_ne!(Limit::from(10.0).0, INF, "Limit(10) == INF should be false");
     }
 
     #[test]
