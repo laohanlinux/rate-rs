@@ -260,7 +260,7 @@ impl Bucket {
         println!("tick: {}", tick);
         self.adjust_available_tokens(tick);
         let available = self.available_tokens - count;
-        if available > 0 {
+        if available >= 0 {
             self.available_tokens = available;
             return Some(Duration::from_secs(0));
         }
@@ -281,6 +281,7 @@ impl Bucket {
 
     // Returns the current time tick, measured in from self.start_time.
     fn current_tick(&self, now: SystemTime) -> i64 {
+        println!("{:?}, {:?}", self.start_time, now);
         println!("{}. {}", now.duration_since(self.start_time).unwrap().as_nanos(), self.fill_interval.as_nanos());
         (now.duration_since(self.start_time).unwrap().as_nanos() / self.fill_interval.as_nanos()) as i64
     }
@@ -463,14 +464,26 @@ mod tests {
 
 
     #[test]
+    fn it_take() {
+        for (i, test) in TakeTest::new().iter().enumerate() {
+            let mut bucket = Bucket::new_bucket(test.fill_interval, test.capacity);
+            for (j, req) in test.reqs.iter().enumerate() {
+                println!("{}:{}, {}", i, j, bucket);
+                let d = bucket.inner_take(bucket.start_time.add(req.time), req.count,INFINITY_DURATION);
+                assert!(d.is_some());
+                assert_eq!(d.unwrap(), req.expect_wait, "test {}.{}, {}, got {:?} want {:?}", i, j, test.about, d, req.expect_wait);
+            }
+        }
+    }
+    #[test]
     fn it_available() {
         for (i, test) in TakeTest::new().iter().enumerate() {
             let mut bucket = Bucket::new_bucket(test.fill_interval, test.capacity);
             for (j, req) in test.reqs.iter().enumerate() {
-                println!("{}:{}", i, j);
-                let d = bucket.inner_take(bucket.start_time.add(req.time), req.count, INFINITY_DURATION);
-                assert!(d.is_some());
-                assert_eq!(d.unwrap(), req.expect_wait, "test {}.{}, {}, got {:?} want {:?}", i, j, test.about, d, req.expect_wait);
+                println!("{}:{}, {}", i, j, bucket);
+                // let d = bucket.take_available(bucket.start_time, req.time);
+                // assert!(d.is_some());
+                // assert_eq!(d.unwrap(), req.expect_wait, "test {}.{}, {}, got {:?} want {:?}", i, j, test.about, d, req.expect_wait);
             }
         }
     }
