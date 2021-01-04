@@ -27,7 +27,7 @@ use std::fmt::{Display, Formatter};
 // tokens that are in the bucket, and it records the current tick
 // number too. Note that it doesn't record the current time - by
 // keeping things in units of whole ticks, it's easy to dish out tokens
-// at exactly the right intervals as measured from the start time.
+// at exactly the right intervals as measured from the epoch time.
 //
 // This allows us to calculate the number of tokens that will be
 // available at some time in the future with a few simple arithmetic
@@ -41,25 +41,23 @@ use std::fmt::{Display, Formatter};
 
 // Bucket represents a token bucket that fills at a predetermined rate.
 // Methods on Bucket may be called concurrently.
-const INFINITY_DURATION: Duration = Duration::from_secs(0);
+const INFINITY_DURATION: Duration = Duration::from_secs(0x7fffffffffffffff);
 // specifies the allowed variance of actual rate from specified rate. 1% seems reasonable.
 const RATE_MARGIN: f64 = 0.01;
 
 pub struct Bucket {
     clock: Box<dyn Clock>,
 
-    // start holds the moment when the bucket was 
-    // first created and ticks began.
-    start_time: SystemTime,
+    // Holds the moment when the bucket was first created and ticks began.
+    epoch_time: SystemTime,
 
-    // capacity holds the overall capacity of the bucket.
+    // Holds the overall capacity of the bucket.
     capacity: i64,
 
-    // quantum holds how many tokens are added on
-    // each tick.
+    // Holds how many tokens are added on each tick.
     quantum: i64,
 
-    // fill_interval holds the interval between each tick.
+    // Holds the interval between each tick.
     fill_interval: Duration,
 
     // Guards the fields below it.
@@ -75,8 +73,8 @@ pub struct Bucket {
 
 impl Display for Bucket {
     fn fmt(&self, f: &mut Formatter<'_>) -> ::std::fmt::Result {
-        writeln!(f, "start_time:{:?}, capacity: {}, quantum: {}, fill_interval: {:?}, available_tokens: {}, latest_tick: {}",
-                 self.start_time, self.capacity, self.quantum, self.fill_interval, self.available_tokens, self.latest_tick)
+        writeln!(f, "epoch_time: {:?}, capacity: {}, quantum: {}, fill_interval: {:?}, available_tokens: {}, latest_tick: {}",
+                 self.epoch_time, self.capacity, self.quantum, self.fill_interval, self.available_tokens, self.latest_tick)
     }
 }
 
@@ -143,10 +141,10 @@ impl Bucket {
             panic!("token bucket quantum is not > 0");
         }
         let clock = clock.or_else(|| Some(Box::new(RealClock {}))).unwrap();
-        let start_time = clock.now();
+        let epoch_time = clock.now();
         Bucket {
             clock,
-            start_time,
+            epoch_time,
             capacity,
             quantum,
             fill_interval,
@@ -257,7 +255,6 @@ impl Bucket {
             return Some(Duration::from_secs(0));
         }
         let tick = self.current_tick(now);
-        println!("tick: {}", tick);
         self.adjust_available_tokens(tick);
         let available = self.available_tokens - count;
         if available >= 0 {
@@ -270,7 +267,7 @@ impl Bucket {
         //
         // end_tick holds the tick when all the requested tokens will become available.
         let end_tick = tick + (-available + self.quantum - 1) / self.quantum;
-        let end_time = self.start_time.add(Duration::from_nanos((end_tick * self.fill_interval.as_nanos() as i64) as u64));
+        let end_time = self.epoch_time.add(Duration::from_nanos((end_tick * self.fill_interval.as_nanos() as i64) as u64));
         let wait_time = end_time.duration_since(now).unwrap();
         if wait_time > max_wait {
             return None;
@@ -279,11 +276,9 @@ impl Bucket {
         Some(wait_time)
     }
 
-    // Returns the current time tick, measured in from self.start_time.
+    // Returns the current time tick, measured in from self.epoch_time.
     fn current_tick(&self, now: SystemTime) -> i64 {
-        println!("{:?}, {:?}", self.start_time, now);
-        println!("{}. {}", now.duration_since(self.start_time).unwrap().as_nanos(), self.fill_interval.as_nanos());
-        (now.duration_since(self.start_time).unwrap().as_nanos() / self.fill_interval.as_nanos()) as i64
+        (now.duration_since(self.epoch_time).unwrap().as_nanos() / self.fill_interval.as_nanos()) as i64
     }
 
     // Adjusts the current number of tokens available in the bucket at the given time, which must
@@ -331,8 +326,9 @@ impl Clock for RealClock {}
 mod tests {
     use tokio::time::Duration;
     use std::time::SystemTime;
-    use crate::{Bucket, INFINITY_DURATION};
-    use std::ops::Add;
+    use crate::{Bucket, INFINITY_DURATION, RATE_MARGIN};
+    use std::ops::{Add, Sub};
+    use std::panic::catch_unwind;
 
     struct RateLimitSuite {}
 
@@ -370,7 +366,7 @@ mod tests {
                     TakeReq::default(),
                     TakeReq { count: 10, ..Default::default() },
                     TakeReq { count: 1, expect_wait: Duration::from_millis(250), ..Default::default() },
-                    TakeReq { time: Duration::from_secs(250), count: 1, expect_wait: Duration::from_millis(250) }
+                    TakeReq { time: Duration::from_millis(250), count: 1, expect_wait: Duration::from_millis(250) }
                 ],
             }, TakeTest {
                 about: "concurrent requests",
@@ -464,27 +460,244 @@ mod tests {
 
 
     #[test]
-    fn it_take() {
+    fn t_take() {
         for (i, test) in TakeTest::new().iter().enumerate() {
             let mut bucket = Bucket::new_bucket(test.fill_interval, test.capacity);
             for (j, req) in test.reqs.iter().enumerate() {
-                println!("{}:{}, {}", i, j, bucket);
-                let d = bucket.inner_take(bucket.start_time.add(req.time), req.count,INFINITY_DURATION);
+                let d = bucket.inner_take(bucket.epoch_time.add(req.time), req.count, INFINITY_DURATION);
                 assert!(d.is_some());
                 assert_eq!(d.unwrap(), req.expect_wait, "test {}.{}, {}, got {:?} want {:?}", i, j, test.about, d, req.expect_wait);
+                // println!("token {:?}, {}, {}, {:?}", req, bucket.available_tokens, bucket.latest_tick, bucket.epoch_time);
             }
         }
     }
+
     #[test]
-    fn it_available() {
+    fn t_take_max_duration() {
         for (i, test) in TakeTest::new().iter().enumerate() {
             let mut bucket = Bucket::new_bucket(test.fill_interval, test.capacity);
             for (j, req) in test.reqs.iter().enumerate() {
-                println!("{}:{}, {}", i, j, bucket);
-                // let d = bucket.take_available(bucket.start_time, req.time);
-                // assert!(d.is_some());
-                // assert_eq!(d.unwrap(), req.expect_wait, "test {}.{}, {}, got {:?} want {:?}", i, j, test.about, d, req.expect_wait);
+                if req.expect_wait > Duration::from_nanos(0) {
+                    let d = bucket.inner_take(bucket.epoch_time.add(req.time), req.count, req.expect_wait.sub(Duration::from_nanos(1)));
+                    assert!(d.is_none(), "{}:{}", i, j);
+                }
+                let d = bucket.inner_take(bucket.epoch_time.add(req.time), req.count, req.expect_wait);
+                assert!(d.is_some(), "{}:{}", i, j);
+                assert_eq!(d.unwrap(), req.expect_wait, "test {}.{}, {}, got {:?} want {:?}", i, j, test.about, d.unwrap(), req.expect_wait);
             }
         }
+    }
+
+    struct TakeAvailableReq {
+        time: Duration,
+        count: i64,
+        expect: i64,
+    }
+
+    impl Default for TakeAvailableReq {
+        fn default() -> Self {
+            TakeAvailableReq {
+                time: Duration::from_secs(0),
+                count: 0,
+                expect: 0,
+            }
+        }
+    }
+
+    struct TakeAvailableTests {
+        about: &'static str,
+        fill_interval: Duration,
+        capacity: i64,
+        reqs: Vec<TakeAvailableReq>,
+    }
+
+    impl TakeAvailableTests {
+        fn new() -> Vec<Self> {
+            vec![
+                TakeAvailableTests {
+                    about: "serial requests",
+                    fill_interval: Duration::from_millis(250),
+                    capacity: 10,
+                    reqs: vec![
+                        TakeAvailableReq { ..Default::default() },
+                        TakeAvailableReq { count: 10, expect: 10, ..Default::default() },
+                        TakeAvailableReq { count: 1, ..Default::default() },
+                        TakeAvailableReq { time: Duration::from_millis(250), ..Default::default() },
+                    ],
+                },
+                TakeAvailableTests {
+                    about: "concurrent requests",
+                    fill_interval: Duration::from_millis(250),
+                    capacity: 10,
+                    reqs: vec![
+                        TakeAvailableReq { count: 5, expect: 5, ..Default::default() },
+                        TakeAvailableReq { count: 2, expect: 2, ..Default::default() },
+                        TakeAvailableReq { count: 5, expect: 3, ..Default::default() },
+                        TakeAvailableReq { count: 1, ..Default::default() }
+                    ],
+                },
+                TakeAvailableTests {
+                    about: "more than capacity",
+                    fill_interval: Duration::from_millis(1),
+                    capacity: 10,
+                    reqs: vec![
+                        TakeAvailableReq { count: 10, expect: 10, ..Default::default() },
+                        TakeAvailableReq { time: Duration::from_millis(20), count: 15, expect: 10 },
+                    ],
+                },
+                TakeAvailableTests {
+                    about: "within capacity",
+                    fill_interval: Duration::from_millis(10),
+                    capacity: 5,
+                    reqs: vec![
+                        TakeAvailableReq { count: 5, expect: 5, ..Default::default() },
+                        TakeAvailableReq { time: Duration::from_millis(60), count: 5, expect: 5 },
+                        TakeAvailableReq { time: Duration::from_millis(70), count: 1, expect: 1 }
+                    ],
+                }
+            ]
+        }
+    }
+
+    #[test]
+    fn t_take_available() {
+        for (i, test) in TakeAvailableTests::new().iter().enumerate() {
+            let mut bucket = Bucket::new_bucket(test.fill_interval, test.capacity);
+            for (j, req) in test.reqs.iter().enumerate() {
+                let d = bucket.inner_take_available(bucket.epoch_time.add(req.time), req.count);
+                assert_eq!(d, req.expect, "test {}.{}, {}, got {}, want {}", i, j, test.about, d, req.expect);
+            }
+        }
+    }
+
+    #[test]
+    fn t_into_panic() {
+        assert_panic(0, 1, true);
+        assert_panic(1, 0, true);
+        assert_panic(1, -2, true);
+    }
+
+    #[test]
+    fn t_rate() {
+        let bucket = Bucket::new_bucket(Duration::from_nanos(1), 1);
+        assert!(is_close_to(bucket.rate(), 1e9, 0.00001), "got {}, want {}", bucket.rate(), 1e9);
+        let bucket = Bucket::new_bucket(Duration::from_secs(2), 1);
+        assert!(is_close_to(bucket.rate(), 0.5, 0.00001), "got {}, want {}", bucket.rate(), 0.5);
+        let bucket = Bucket::new_bucket_with_quantum(Duration::from_millis(100), 1, 5);
+        assert!(is_close_to(bucket.rate(), 50.0, 0.00001), "got {}, want {}", bucket.rate(), 50.0);
+
+        for rate in (1..1000_000).step_by(7) {
+            check_rate(rate as f64);
+        }
+
+        for rate in vec![
+            1024.0 * 1024.0 * 1024.0,
+            1e-5,
+            0.9e-5,
+            0.5,
+            0.9,
+            0.9e8,
+            3e12,
+            4e18,
+            i64::max_value() as f64] {
+            check_rate(rate);
+            check_rate(rate / 3.0);
+            check_rate(rate * 1.3);
+        }
+    }
+
+    // struct AvailTests {
+    //     about: &'static str,
+    //     capacity: i64,
+    //     fill_interval: Duration,
+    //     take: i64,
+    //     sleep: Duration,
+    //
+    //     expect_count_after_take: i64,
+    //     expect_count_after_sleep: i64,
+    // }
+    //
+    // impl AvailTest {
+    //     fn new() -> Vec<Self> {
+    //         vec![
+    //             AvailTest {
+    //                 about: "should fill tokens after interval",
+    //                 capacity: 5,
+    //                 fill_interval: Duration::from_secs(1),
+    //                 take: 5,
+    //                 sleep: Duration::from_secs(1),
+    //                 expect_count_after_take: 0,
+    //                 expect_count_after_sleep: 1,
+    //             },
+    //             AvailTest {
+    //                 about: "should fill tokens plus existing count",
+    //                 capacity: 2,
+    //                 fill_interval: Duration::from_secs(1),
+    //                 take: 1,
+    //                 sleep: Duration::from_secs(1),
+    //                 expect_count_after_take: 1,
+    //                 expect_count_after_sleep: 2,
+    //             },
+    //             AvailTest {
+    //                 about: "shouldn't fill before interval",
+    //                 capacity: 2,
+    //                 fill_interval: Duration::from_secs(2),
+    //                 take: 1,
+    //                 sleep: Duration::from_secs(1),
+    //                 expect_count_after_take: 1,
+    //                 expect_count_after_sleep: 1,
+    //             },
+    //             AvailTest {
+    //                 about: "should fill only once after 1*interval before 2 * interval",
+    //                 capacity: 2,
+    //                 fill_interval: Duration::from_secs(2),
+    //                 take: 1,
+    //                 sleep: Duration::from_secs(3),
+    //                 expect_count_after_take: 1,
+    //                 expect_count_after_sleep: 2,
+    //             },
+    //         ]
+    //     }
+    // }
+
+    #[test]
+    fn t_available() {
+        for (i, test) in AvailTest::new().iter().enumerate() {
+            let mut bucket = Bucket::new_bucket(test.fill_interval, test.capacity);
+            let c = bucket.inner_take_available(bucket.epoch_time);
+            assert_eq!(c, test.take_available, "#{}: {}, take = {}, wait = {}", i, test.about, c, test.take);
+            let c = bucket.inner_available(bucket.epoch_time).await;
+            assert_eq!(c, test.expect_count_after_take, "#{}: {}, after take, available = {}, wait = {}", i, test.about, c, test.expect_count_after_take);
+            let c = bucket.inner_available(bucket.epoch_time.add(test.sleep)).await;
+            assert_eq!(c, test.expect_count_after_sleep, "#{}: {}, after some time it should fill in new tokens, available = {}, wait = {}", i, test.about, c, test.expect_count_after_sleep);
+        }
+    }
+
+    fn assert_panic(fill_interval: u64, capacity: i64, expect: bool) {
+        let catch = catch_unwind(|| {
+            Bucket::new_bucket(Duration::from_millis(fill_interval), capacity);
+        });
+        assert_eq!(catch.is_err(), expect);
+    }
+
+    fn check_rate(rate: f64) {
+        let mut bucket = Bucket::new_bucket_with_rate(rate, 1 << 62);
+        assert!(is_close_to(bucket.rate(), rate, RATE_MARGIN), "got {}, want {}", bucket.rate(), rate);
+        let d = bucket.inner_take(bucket.epoch_time, 1 << 62, INFINITY_DURATION);
+        assert!(d.is_some());
+        assert_eq!(d.unwrap(), Duration::from_secs(0));
+
+        // Checks that the actual rate is as expected by
+        // asking for a not-quite multiple of the bucket's
+        // quantum and checking that the wait time correct.
+        let d = bucket.inner_take(bucket.epoch_time, bucket.quantum * 2 - bucket.quantum / 2, INFINITY_DURATION);
+        assert!(d.is_some());
+        let expected_time = 1e9 * 2.0 * bucket.quantum as f64 / rate;
+        let d = d.unwrap().as_nanos() as f64;
+        assert!(is_close_to(d, expected_time, RATE_MARGIN), "rate:{}, got {}, want {:?}", rate, d, expected_time);
+    }
+
+    fn is_close_to(x: f64, y: f64, tolerance: f64) -> bool {
+        (x - y).abs() / y < tolerance
     }
 }
