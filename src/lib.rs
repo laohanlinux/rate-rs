@@ -174,7 +174,7 @@ impl Bucket {
     }
 
     // Takes count tokens from the bucket, waiting until they are available.
-    pub async fn wait(&mut self, count: i64) {
+    pub async fn wait(&self, count: i64) {
         let duration = self.take(count).await;
         if duration.as_nanos() > 0 {
             self.clock.sleep(duration).await;
@@ -184,7 +184,7 @@ impl Bucket {
     // Like `wait` except that it will only take tokens from the bucket if it needs to wait for no greater than *max_wait*.
     // It reports whether any tokens have been removed from the bucket
     // If no tokens have been removed, it returns immediately.
-    pub async fn wait_max_duration(&mut self, count: i64, max_wait: Duration) -> bool {
+    pub async fn wait_max_duration(&self, count: i64, max_wait: Duration) -> bool {
         if let Some(duration) = self.take_max_duration(count, max_wait).await {
             self.clock.sleep(duration).await;
             true
@@ -198,7 +198,7 @@ impl Bucket {
     ///
     /// Note that if the request is irrevocale - there is no way to return tokens to the bucket
     /// once this method commits use to taking them.
-    pub async fn take(&mut self, count: i64) -> Duration {
+    pub async fn take(&self, count: i64) -> Duration {
         self.inner_take(self.clock.now(), count, INFINITY_DURATION)
             .or_else(|| Some(Duration::from_secs(0)))
             .unwrap()
@@ -210,20 +210,20 @@ impl Bucket {
     /// If it would take longer than max_wait for the tokens to become avalible, it does nothing
     /// and reports false, otherwise it returns the time that the caller should wait until the
     /// tokens are actually avalible, and reports true.
-    pub async fn take_max_duration(&mut self, count: i64, max_wait: Duration) -> Option<Duration> {
+    pub async fn take_max_duration(&self, count: i64, max_wait: Duration) -> Option<Duration> {
         self.inner_take(self.clock.now(), count, max_wait)
     }
 
     /// Takes up to count immediately avalible tokens from the
     /// bucket. It returns the number of tokens removed, or zero if there are no avalible tokens,
     /// It doesn't block.
-    pub async fn take_available(&mut self, count: i64) -> i64 {
+    pub async fn take_available(&self, count: i64) -> i64 {
         self.inner_take_available(self.clock.now(), count)
     }
 
     // The interval version of `take_available` - it takes the
     // current time as an argument to enable easy testing.
-    fn inner_take_available(&mut self, now: SystemTime, mut count: i64) -> i64 {
+    fn inner_take_available(&self, now: SystemTime, mut count: i64) -> i64 {
         if count <= 0 {
             return 0;
         }
@@ -245,13 +245,13 @@ impl Bucket {
     /// tokens from the buffer will succeed, as the number of available
     /// tokens could have changed in the meantime. This method is intended
     /// primarily for metrics reporting and debugging.
-    pub fn available(&mut self) -> i64 {
+    pub fn available(&self) -> i64 {
         self.inner_available(self.clock.now())
     }
 
     // The interval version of available - it takes the current time as
     // an argument to enable easy testing.
-    fn inner_available(&mut self, now: SystemTime) -> i64 {
+    fn inner_available(&self, now: SystemTime) -> i64 {
         self.adjust_available_tokens(self.current_tick(now));
         let state = self.state.lock().unwrap();
         state.available_tokens
@@ -269,7 +269,7 @@ impl Bucket {
 
     // The interval version of available - it takes the current time as
     // an argument to enable easy testing.
-    fn inner_take(&mut self, now: SystemTime, count: i64, max_wait: Duration) -> Option<Duration> {
+    fn inner_take(&self, now: SystemTime, count: i64, max_wait: Duration) -> Option<Duration> {
         if count < 0 {
             return Some(Duration::from_secs(0));
         }
@@ -306,7 +306,7 @@ impl Bucket {
 
     // Adjusts the current number of tokens available in the bucket at the given time, which must
     // be in the future (positive) with respect to tb.latest_tick.
-    fn adjust_available_tokens(&mut self, tick: i64) {
+    fn adjust_available_tokens(&self, tick: i64) {
         let mut state = self.state.lock().unwrap();
         let latest_tick = state.latest_tick;
         state.latest_tick = tick;
@@ -348,10 +348,17 @@ impl Clock for RealClock {}
 
 #[cfg(test)]
 mod tests {
+    #![feature(test)]
+
     use tokio::time::{Duration, sleep};
-    use crate::{Bucket, INFINITY_DURATION, RATE_MARGIN};
+    use crate::{Bucket, INFINITY_DURATION, RATE_MARGIN, Clock};
     use std::ops::{Add, Sub};
     use std::panic::catch_unwind;
+    use test::Bencher;
+    use std::sync::{Arc, Mutex};
+    use std::fs::File;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::SystemTime;
 
     #[derive(Debug)]
     struct TakeReq {
@@ -875,5 +882,70 @@ mod tests {
 
     fn is_close_to(x: f64, y: f64, tolerance: f64) -> bool {
         (x - y).abs() / y < tolerance
+    }
+
+    #[test]
+    fn draw_plot() {
+        use plotlib::page::Page;
+        use plotlib::repr::Plot;
+        use plotlib::view::ContinuousView;
+        use plotlib::style::{PointMarker, PointStyle};
+
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        let token_data: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(vec![]));
+        let mut bucket = Bucket::new_bucket(Duration::from_millis(1), 1 << 62);
+
+        rt.block_on(async {
+            let now = SystemTime::now();
+            for i in 0..100 {
+                let bucket = bucket.clone();
+                let token_data = token_data.clone();
+                rt.spawn(async move {
+                    let d1 = SystemTime::now().duration_since(now).unwrap().as_nanos() as f64;
+                    let duration = bucket.take(1).await;
+                    if duration.as_nanos() > 0 {
+                        bucket.clock.sleep(duration).await;
+                    }
+                    let mut token_data = token_data.lock().unwrap();
+                    let d2 = SystemTime::now().duration_since(now).unwrap().as_nanos() as f64;
+                    token_data.push((d1 / 1000000.0, d2 / 100000.0));
+                });
+            }
+        });
+        ::std::thread::sleep(Duration::from_secs(3));
+        // We create our scatter plot from the data
+        let v = token_data.lock().unwrap().clone();
+        println!("{:?}", v);
+
+        let s1: Plot = Plot::new(v).point_style(
+            PointStyle::new()
+                .marker(PointMarker::Square) // setting the marker to be a square
+                .colour("#DD3355"),
+        ); // and a custom colour
+        let v = ContinuousView::new()
+            .add(s1)
+            .x_range(0., 10.)
+            .y_range(0., 100.)
+            .x_label("Some varying variable")
+            .y_label("The response of something");
+
+        // A page with a single view is then saved to an SVG file
+        Page::single(&v).save("scatter.svg").unwrap();
+    }
+
+    extern crate test;
+
+    #[bench]
+    fn benchmarks(b: &mut Bencher) {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let count = Arc::new(AtomicUsize::new(1));
+        rt.block_on(async {
+            let bucket = Arc::new(Bucket::new_bucket(Duration::from_nanos(1), 16 * 1024));
+            b.iter(async || {
+                bucket.wait(1).await;
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            tokio::fs::write("count.text", format!("{}", count.load(Ordering::SeqCst))).await;
+        });
     }
 }

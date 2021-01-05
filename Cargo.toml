@@ -9,3 +9,12 @@ edition = "2018"
 [dependencies]
 async-trait = "0.1.42"
 tokio = { version = "1", features = ["full"] }
+pprof = { version = "0.4.0", features = ["flamegraph"] }
+
+[dev-dependencies]
+criterion = "0.3"
+plotlib = "0.5.1"
+
+[[bench]]
+name = "my_benchmark"
+harness = false
